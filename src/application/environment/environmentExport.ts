@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import { getHeapStatistics } from "node:v8";
 
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
@@ -90,9 +91,29 @@ const systemCode = (cause: unknown): string | undefined =>
     ? cause.code
     : undefined;
 
+/** Recovery for a host write failure that may leave partial output behind. */
+const hostWriteFailure = (directory: string) => ({
+  userMessage: `Writing the environment bundle to ${directory} failed on the host; the details name the cause and failed path.`,
+  remediationAction: `Resolve the reported host failure (for example, choose a shorter destination path or free disk space). Inspect ${directory} and remove any partial output this export wrote before retrying, since a retry refuses a non-empty directory.`,
+  diagnostics: { output_directory: directory },
+});
+
+/** The host failure beneath a wrapper, whose message names its code and absolute path. */
+const hostSystemError = (cause: Error): Error | undefined => {
+  const seen = new Set<unknown>([cause]);
+  let current = cause.cause;
+  while (current instanceof Error && !seen.has(current)) {
+    if (systemCode(current) !== undefined) return current;
+    seen.add(current);
+    current = current.cause;
+  }
+  return undefined;
+};
+
 const accessDeniedError = (
   cause: unknown,
   path: string,
+  diagnostics?: Readonly<Record<string, JsonValue>>,
 ): AnalysisAccessDeniedError | undefined => {
   const seen = new Set<Error>();
   let current = cause;
@@ -106,6 +127,7 @@ const accessDeniedError = (
         code,
         {
           cause,
+          ...(diagnostics === undefined ? {} : { diagnostics }),
           ...(cause instanceof ArtifactReaderFailure &&
           cause.cleanup !== undefined
             ? { cleanup: cause.cleanup }
@@ -115,6 +137,20 @@ const accessDeniedError = (
       bindArtifactFileCleanup(cause, error);
       return error;
     }
+    current = current.cause;
+  }
+  return undefined;
+};
+
+/** The absolute path a host failure beneath wrappers names, if it names one. */
+const hostFailurePath = (cause: unknown): string | undefined => {
+  const seen = new Set<unknown>();
+  let current = cause;
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    const path = Reflect.get(current, "path");
+    if (systemCode(current) !== undefined && typeof path === "string")
+      return isAbsolute(path) ? path : undefined;
     current = current.cause;
   }
   return undefined;
@@ -291,7 +327,13 @@ export const exportEnvironmentBundle = async (
     files = await writeEnvironmentBundle(input, plan.value);
   } catch (cause: unknown) {
     if (cause instanceof AnalysisError) return err(cause);
-    const denied = accessDeniedError(cause, input.directory);
+    // A refused bundle write names the path the host refused, which may be a
+    // nested file after earlier files were written into the directory.
+    const denied = accessDeniedError(
+      cause,
+      hostFailurePath(cause) ?? input.directory,
+      { output_directory: input.directory },
+    );
     if (denied !== undefined) return err(denied);
     if (cause instanceof RegularFileChangedError)
       return err(
@@ -303,23 +345,17 @@ export const exportEnvironmentBundle = async (
         ),
       );
     if (cause instanceof ArtifactReaderFailure) {
-      if (cause.reason === "path" && cause.cleanup === undefined)
-        return err(
-          inputError(
-            {
-              path: ["directory"],
-              reason: "invalid_value",
-              message: cause.message,
-            },
-            cause.message,
-          ),
-        );
+      const host = hostSystemError(cause);
       const error = new AnalysisOutputError(
         ENVIRONMENT_EXPORT_OPERATION,
-        cause.message,
+        host === undefined
+          ? cause.message
+          : `${cause.message}: ${host.message}`,
         {
           cause,
-          ...(cause.cleanup === undefined ? {} : { cleanup: cause.cleanup }),
+          ...(cause.cleanup === undefined
+            ? hostWriteFailure(input.directory)
+            : { cleanup: cause.cleanup }),
         },
       );
       bindArtifactFileCleanup(cause, error);
@@ -329,6 +365,7 @@ export const exportEnvironmentBundle = async (
       return err(
         new AnalysisOutputError(ENVIRONMENT_EXPORT_OPERATION, cause.message, {
           cause,
+          ...hostWriteFailure(input.directory),
         }),
       );
     throw cause;
